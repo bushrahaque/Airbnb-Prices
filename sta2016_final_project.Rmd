@@ -1,0 +1,572 @@
+---
+author: "Bushra Haque"
+title: 'Toronto Airbnbs: An Areal Analysis'
+output:
+  html_document:
+  number_sections: true
+  fig_caption: true
+---
+<style>
+.html-widget {
+    margin: auto;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(kableExtra)
+library(tidyverse)
+library(leaflet)
+library(leaflegend)
+library(sf)
+library(geoR)
+library(ggmap)
+library(fields)
+library(maps)
+library(mapdata)
+library(units)
+library(mgcv)
+library(mgcViz)
+library(spdep)
+library(spData)
+library(spatialreg) # for SAR and CAR
+library(spgwr) # for GWR
+library(spaMM) # for mixed effects models
+library(spatstat)
+library(splancs)
+library(dbscan)
+```
+
+\newpage
+
+# 1 Introduction
+
+The rise of short-term rentals, and the platforms that enable them, have changed urban landscapes and housing markets across metropolitan cities worldwide. Platforms such as Airbnb were originally conceived to support a mutually beneficial relationship: to connect homeowners and travelers looking for affordable accommodations. However people recognized the profitability of unregulated short-term rentals and it quickly became an investment scheme that transformed the hospitality industry and accelerated the housing crisis.
+
+The City of Toronto is a vibrant mosaic of its neighbourhoods, each uniquely defined by its people and its topology among other characteristics. As such, each neighbourhood has also experienced the impacts of short-terms rentals to a different degree. In recent years, the local government has been steadily increasing regulations surrounding short-term rentals in hopes of reducing the impact on the housing crisis. This report is motivated accordingly and aims to study the dynamics of short-term trends from a spatial perspective by exploring the diversity of Airbnb listings across neighbourhoods in Toronto.
+
+In particular, this report examines Price per Night as the main variable of interest (i.e., the dependent variable). The analysis leverages Airbnb listing data for Toronto as-of September 5, 2024 and analyzes various covariates and their impact on the dependent variable.
+
+# 2 Methods
+
+## 2.1 Data Sources
+
+This report relieson data from three distinct sources. See Section 2.2 for data processing steps.
+
+**Airbnb Listing Data**: sourced from [Inside Airbnb](https://insideairbnb.com/), the dataset is a snapshot of current listings, and includes fields such as listing and host IDs, accommodation type and price per night. Note the following assumptions associated with this data source:
+
+- Location has been anonymized by Airbnb, and the provided latitude and longitude are within 150 meters of the actual location.
+- Price per night reflects the price on the snapshot date. Hosts can enable dynamic pricing so the price per night might be different for any two selected nights.
+
+**Income Data**: sourced from the Toronto neighbourhood statistics data used for Homework 3. This data is current to 2023 and on a neighbourhood grain. For each neighbourhood, the median income and population fields are used.
+
+**Toronto Open Data**: sourced from the City of Toronto's [Open Data Portal](https://open.toronto.ca/), two files (both projected to WGS 84) are used:
+
+- Toronto Neighbourhoods: considers the historical 140 neighbourhood Shapefile to obtain the neighbourhood boundaries.
+- TTC Routes and Schedules: considers the TTC Stops file to identify the latitude and longitude of subway stations.
+
+**Landmark Data**: sourced by geocoding top 10 Toronto Landmarks from [TripAdvisor](https://www.tripadvisor.ca/Attractions-g155019-Activities-c47-Toronto_Ontario.html) using a Google API Key.
+
+## 2.2 Data Processing
+
+Prior to joining the above-stated data sources and performing any spatial computations, the following data pre-processing steps are carried out:
+
+1. Neighbourhood names are updated to be consistent across all data sources to ensure any joins on this field would be accurate. Fields are cast to the correct data type (e.g., numeric) as required.
+2. TTC Stops Data: the dataset is filtered to only contain subway stations.
+3. All dataframes containing location information are set as `sf` objects using the 4326 CRS/WGS 84 projection.
+
+**Buffers**: for TTC Stops and Landmarks, spatial buffers are created based on distances of 1 kilometer and 2 kilometers respectively. Then using a spatial intersection, an Airbnb listing can be defined to be near a subway and landmark if it is within the specified buffer.
+
+- Buffers for only created in relation to TTC subway stations and not other stops such as bus and streetcar stops. This is because considering bus stops would effectively include capture most of Toronto given the frequency of bus stops across the city. 
+- These distances are chosen to reflect ease-of-access via walking. That is, within 1 kilometer (i.e., 10-15 minute walk) of subway stations and within 2 kilometers (i.e., 20-30 min walk) of major landmarks. This report does not assess the impact of different buffer sizes.
+
+**Feature Engineering**: the final dataset is obtained by aggregating on the Neighbourhood field (or using pre-aggregated fields) to obtain:
+
+1. Average Price per Night
+2. Median Income in 2023 (expressed in thousands)
+3. Number of Listings (and per 1000 People)
+4. Number of Listings near TTC Subway Station (and % of All Listings)
+5. Number of Listings near Top 10 Toronto Landmarks (and % of All Listings)
+
+All monetary amounts are assumed to be in Canadian dollars. The resultant geospatial data type is areal. A preview of the dataset can be found in Table 1.
+
+```{r data-load, message=FALSE, warning=FALSE, include=FALSE}
+data.dir = gsub('/code', '/data', getwd())
+tdot.srid = 32617
+
+# Load airbnb data:
+airbnb_sept = st_read(paste0(data.dir, '/data/listings_sept2024.csv')) %>%
+  select('id', 'neighbourhood', 'latitude', 'longitude', 'price') %>%
+  mutate(listing_id=as.numeric(id), price=as.numeric(ifelse(price=='','0',price)), latitude=as.numeric(latitude), longitude=as.numeric(longitude)) %>%
+  mutate(neighbourhood=ifelse(neighbourhood=='Danforth East York', 'Danforth-East York', neighbourhood)) %>%
+  mutate(neighbourhood=ifelse(neighbourhood=='Mimico (includes Humber Bay Shores)', 'Mimico', neighbourhood)) %>%
+  st_as_sf(coords=c('latitude', 'longitude'), crs=4326, remove=FALSE)
+
+airbnb_march = st_read(paste0(data.dir, '/data/listings_march2024.csv')) %>%
+  select('id', 'neighbourhood', 'latitude', 'longitude', 'price') %>%
+  mutate(listing_id=as.numeric(id), price=as.numeric(ifelse(price=='','0',price)), latitude=as.numeric(latitude), longitude=as.numeric(longitude)) %>%
+  mutate(neighbourhood=ifelse(neighbourhood=='Danforth East York', 'Danforth-East York', neighbourhood)) %>%
+  mutate(neighbourhood=ifelse(neighbourhood=='Mimico (includes Humber Bay Shores)', 'Mimico', neighbourhood)) %>%
+  st_as_sf(coords=c('latitude', 'longitude'), crs=4326, remove=FALSE)
+
+# Load income data:
+stat = st_read(paste0(data.dir, '/data/neighbourhood-stats-1.csv')) %>%
+  mutate(neighbourhood=ifelse(Neighbourh=='Dovercourt-Wallace Emerson-Juncti', 'Dovercourt-Wallace Emerson-Junction', Neighbourh)) %>%
+  mutate(median_income=as.numeric(median_family_income)/1000) %>%
+  select('neighbourhood', 'median_income')
+
+# Load shape files:
+nbhd.shp = st_read(paste0(data.dir, '/data/Toronto_Neighbourhoods/Toronto_Neighbourhoods.shp')) %>%
+  mutate(neighbourhood=ifelse(Neighbourh=='Dovercourt-Wallace Emerson-Juncti', 'Dovercourt-Wallace Emerson-Junction', Neighbourh)) %>%
+  mutate(population=as.numeric(Total_Popu)) %>%
+  select('neighbourhood', 'geometry', 'population')
+
+ttc = read.delim(paste0(data.dir, '/data/TTC Routes and Schedules Data/stops.txt'), sep=',') %>%
+  filter(((stop_id >= 14404) & (stop_id <= 14539)) | ((stop_id >= 15692) & (stop_id <= 15702))) %>%
+  separate(col='stop_name', sep=' - ', into=c('station_name', 'station_type')) %>%
+  filter(station_name != 'Yonge Station') %>%
+  group_by(station_name) %>%
+  filter(min_rank(desc(stop_id))==1) %>%
+  select('station_name', 'latitude'='stop_lat', 'longitude'='stop_lon') %>% 
+  st_as_sf(coords=c('latitude', 'longitude'), crs=4326, remove=FALSE)
+
+ttc.proj = ttc %>% st_transform(crs=tdot.srid)
+```
+
+```{r data-landmarks, message=FALSE, warning=FALSE, include=FALSE}
+register_google(key = "AIzaSyD1Rdw1ZNe5byS8M5vGcwjy_hssCDsbPYQ")
+
+landmarks <- c("CN Tower, Toronto",
+               "Royal Ontario Museum, Toronto",
+               "Ripley's Aquarium of Canada, Toronto",
+               "Distillery Historic District, Toronto",
+               "Art Gallery of Ontario, Toronto",
+               "Casa Loma, Toronto",
+               "Toronto Islands, Toronto",
+               "St. Lawrence Market, Toronto",
+               "Hockey Hall of Fame, Toronto",
+               "Nathan Phillips Square, Toronto")
+
+geocoded_data <- geocode(landmarks)
+landmarks_df <- data.frame(
+  name = landmarks,
+  latitude = geocoded_data$lat,
+  longitude = geocoded_data$lon
+) %>%
+st_as_sf(coords=c('latitude', 'longitude'), crs=4326, remove=FALSE)
+```
+
+```{r data-buffer, message=FALSE, warning=FALSE, include=FALSE}
+ttc.buffer = ttc.proj %>%
+  st_buffer(dist=1000)
+
+lndmark.buffer = landmarks_df %>%
+  st_transform(crs=tdot.srid) %>%
+  st_buffer(dist=2000)
+
+airbnb_sept.ttc = st_join(ttc.buffer, st_transform(airbnb_sept, crs=tdot.srid), join=st_intersects, left=TRUE) %>%
+  st_drop_geometry() %>%
+  select('listing_id') %>%
+  unique()
+
+airbnb_sept.lndmark = st_join(lndmark.buffer, st_transform(airbnb_sept, crs=tdot.srid), join=st_intersects, left=TRUE) %>%
+  st_drop_geometry() %>%
+  select('listing_id') %>%
+  unique()
+
+airbnb_sept.ttc.list = as.vector(airbnb_sept.ttc[['listing_id']])
+airbnb_sept.lndmark.list = as.vector(airbnb_sept.lndmark[['listing_id']])
+```
+
+```{r data-agg-join, message=FALSE, warning=FALSE, include=FALSE}
+# Aggregate data:
+airbnb_sept_agg = airbnb_sept %>%
+  mutate(near_subway=ifelse(listing_id %in% airbnb_sept.ttc.list, 1, 0)) %>%
+  mutate(near_landmark=ifelse(listing_id %in% airbnb_sept.lndmark.list, 1, 0)) %>%
+  group_by(neighbourhood) %>%
+  summarise(avg_price_per_night=as.numeric(mean(price)), n_listings=n(), n_listings_near_subway=as.numeric(sum(near_subway)), n_listings_near_landmark=as.numeric(sum(near_landmark))) %>%
+  st_drop_geometry()
+
+# Join data:
+nbhd.stats = merge(nbhd.shp, stat, by='neighbourhood') %>%
+  select('neighbourhood', 'median_income', 'population', 'geometry')
+
+nbhd.stats1 = merge(nbhd.stats, airbnb_sept_agg, by='neighbourhood', all.x=TRUE)
+```
+
+```{r data-feature-eng, message=FALSE, warning=FALSE, include=FALSE}
+nbhd = nbhd.stats1 %>%
+  mutate(
+    n_listings_per_capita=n_listings * 1000 / population,
+    pct_listings_near_subway=n_listings_near_subway / n_listings,
+    pct_listings_near_landmark=n_listings_near_landmark / n_listings,
+    is_outlier=ifelse(neighbourhood %in% c('Bridle Path-Sunnybrook-York Mills', 'Scarborough Village'),1,0)
+  )
+
+nbhd.proj = nbhd %>% st_transform(crs=tdot.srid)
+```
+
+```{r view-data, include=FALSE}
+nbhd.tmp = nbhd %>% st_drop_geometry()
+kable(head(nbhd.tmp))
+```
+
+| Neighbourhood                 | Median Income | Population | Avg. Price per Night | Number of Listings | Number of Listings Near Subway | Number of Listings Near Landmark | Number of Listings per Capita | Percent of Listings Near Subway | Percent of Listings Near Landmark |
+|:-------------------------------|:---------------|:------------|:----------------------|:------------|:-------------------------|:--------------------------|:------------------------|:--------------------------|:---------------------------|
+| Agincourt North              | 91            | 30,280     | 63.38               | 52         | 0                       | 0                        | 1.7173                | 0.0000                   | 0.0000                    |
+| Agincourt South-Malvern West | 88            | 21,990     | 68.95               | 122        | 0                       | 0                        | 5.5480                | 0.0000                   | 0.0000                    |
+| Alderwood                    | 130           | 11,900     | 107.46              | 70         | 41                      | 0                        | 5.8824                | 0.5857                   | 0.0000                    |
+| Annex                        | 144           | 29,180     | 193.28              | 689        | 689                     | 689                      | 23.6121               | 1.0000                   | 1.0000                    |
+| Banbury-Don Mills            | 119           | 26,910     | 179.98              | 81         | 54                      | 23                       | 3.0100                | 0.6667                   | 0.2840                    |
+| Bathurst Manor               | 113           | 15,435     | 118.12              | 110        | 109                     | 0                        | 7.1267                | 0.9909                   | 0.0000                    |
+<p style="text-align:center;">**Table 1**: Preview of First 6 Rows of Cleaned Dataset</p>
+
+## 2.3 Spatial Exploration
+
+### 2.3.1 Overview of Patterns in Average Price per Night
+
+First consider the spatial map in Figure 1 which details the Average Price per Night across neighbourhoods in Toronto, as-of September 5, 2024. Locations of TTC Subway Stations are denoted by black dots and locations of the Top 10 Landmarks are denoted by purple dots on the map. 
+
+- At a glance, most neighbourhoods have an average price of \$100 to \$200. 
+- Majority of the neighbourhoods that have an average price of around $250 per night (shaded in yellow) appear to be close to subway stations in the downtown core and along Yonge St. 
+- There are two neighbourhoods that have an average price of \$400 or above: Bridle Path-Sunnybrook-York Mills and Scarborough Village. The former is well-known to be one of the most affluent neighbourhoods in the city which explains its high price. The latter, while far away from much of the city, has many lakefront properties which might explain its higher price but doesn't explain why adjacent neighbourhoods bordering the lake have much lower prices.
+
+Based on the last note, a Boolean variable is included in the features to indicate whether the neighbourhood is one of Bridle Path-Sunnybrook-York Mills or Scarborough Village (i.e., outlier). This may be a pivotal feature when fitting regression models as it will allow the model to separate out the "outliers" and better generalize for the remaining 138 neighbourhoods.
+
+```{r map1, message=FALSE, warning=FALSE, fig.cap="**Figure 1**: Average Price per Night across Toronto and Notable Locations", fig.align='center'}
+pal = colorNumeric(palette =c('darkgreen', 'yellow', 'red'), domain = c(0,525))
+  
+nbhd %>%
+  leaflet() %>%
+  addProviderTiles('CartoDB.Positron') %>%
+  addPolygons(weight=1.2, fillOpacity=0.6, label=~paste0(neighbourhood, ': $', round(avg_price_per_night,2)), color=~pal(avg_price_per_night)) %>%
+  addCircles(data=ttc, lng=~longitude, lat=~latitude, color='black', opacity=0.9, radius=0.005, label=~station_name) %>%
+  addCircles(data=landmarks_df, lng=~longitude, lat=~latitude, color='purple', opacity=0.9, radius=0.005, label=~name) %>%
+  leaflet::addLegend(pal = pal, values = ~as.numeric(avg_price_per_night), title = "Avg. Price per Night ($)", opacity = 0.7)
+```
+
+### 2.3.2 Global Moran's I
+
+Prior to computing Global Moran's I, consider the following adjacency matrices types which are generally uniquely well-suited based on the study context:
+
+- **Queen**: well-suited for spatial relationships based on shared boundaries, such as regions or neighbourhoods. (e.g., electoral boundaries)
+- **Distance Based**: ideal for capturing spatial relationships between areal units within a specified range or proximity
+- **k-Nearest Neighbours (kNN)**: ideal to ensure each area unit has a fixed number of neighbours; useful for irregularly sized and distributed areal units
+
+The connectivity of neighbourhoods based on various adjacency matrices is illustrated in Figure 2. Given that the Average Price per Night is the result of a somewhat arbitrary aggregation to neighbourhood-level, and that patterns in price might "transcend" neighbourhood boundaries, a Distance based adjacency matrix might be the most appropriate.
+
+```{r adj-matrices, message=FALSE, warning=FALSE}
+# QUEEN
+queen<-poly2nb(nbhd, queen=TRUE)
+queen.wts<-nb2listw(queen, style='W')
+
+# KNN
+nbhd.centroids <- st_centroid(nbhd)
+coords <- st_coordinates(nbhd.centroids)
+
+knn3<-knn2nb(knearneigh(coords, k=3))
+knn3.wts<-nb2listw(knn3, style='W')
+
+knn6<-knn2nb(knearneigh(coords, k=6))
+knn6.wts<-nb2listw(knn6, style='W')
+
+# DISTANCE
+knn1<-knn2nb(knearneigh(coords, k=1))
+ndist<-unlist(nbdists(knn1, coords))
+max.dist<-max(ndist)
+dist1<-dnearneigh(coords, d1=0, d2=max.dist)
+dist1.wts<-nb2listw(dist1, style='W', zero.policy=TRUE)
+```
+
+```{r plot-adj, message=FALSE, warning=FALSE, fig.cap="**Figure 2**: Various Adjaceny Matrices", fig.align='center'}
+par(mfrow = c(2, 2), mar = c(1,1,1,1))
+
+plot(st_geometry(nbhd), border = "lightgray", main = "a) Queen Contiguity")
+plot(queen, st_coordinates(st_centroid(st_geometry(nbhd))), add = TRUE, col = "blue", lwd = 1)
+
+plot(st_geometry(nbhd), border = "lightgray", main="b) Distance Neighbours")
+plot(dist1, coords, add=TRUE,col="blue", lwd=1)
+
+plot(st_geometry(nbhd), border = "lightgray", main="c) kNN-3")
+plot(knn3,st_coordinates(st_centroid(st_geometry(nbhd))),add=TRUE, col="blue", lwd=1)
+
+plot(st_geometry(nbhd), border = "lightgray", main="d) kNN-6")
+plot(knn6,st_coordinates(st_centroid(st_geometry(nbhd))),add=TRUE, col="blue", lwd=1)
+```
+
+The Moran's I statistics for the above adjacency matrices using their corresponding weight matrices are detailed in Table 2. The Distance based weights results in the highest Moran's I = $0.217$. All weight matrices yield a positive Moran's I indicating positive spatial autocorrelation such that similar values of price per night are clustered together. Note that all p-values are below $0.05$ and thus considered to be statistically significant. In other words, the null hypothesis that there is no spatial autocorrelation is rejected.
+
+```{r global-moran, include=FALSE}
+moran.queen<-moran.test(nbhd$avg_price_per_night,queen.wts,randomisation=FALSE)
+moran.knn3<-moran.test(nbhd$avg_price_per_night,knn3.wts,randomisation=FALSE)
+moran.knn6<-moran.test(nbhd$avg_price_per_night,knn6.wts,randomisation=FALSE)
+moran.dist1<-moran.test(nbhd$avg_price_per_night,dist1.wts,randomisation=FALSE)
+
+data.frame(
+  weight.matrix=c('Queen', 'kNN3', 'kNN6', 'IDW'), 
+  moran.I=c(moran.queen$estimate[1], moran.knn3$estimate[1], moran.knn6$estimate[1], moran.dist1$estimate[1]),
+  expectation=c(moran.queen$estimate[2], moran.knn3$estimate[2], moran.knn6$estimate[2], moran.dist1$estimate[2]),
+  variance=c(moran.queen$estimate[3], moran.knn3$estimate[3], moran.knn6$estimate[3], moran.dist1$estimate[3]),
+  p.value=c(moran.queen$p.value, moran.knn3$p.value, moran.knn6$p.value, moran.dist1$p.value)
+)
+```
+
+| Weight Matrix | Moran's I  | Expectation    | Variance      | p-value        |
+|:---------------|:------------|:----------------|:---------------|:----------------|
+| Queen         | 0.2138924  | -0.007194245   | 0.002386915   | 3.015996e-06   |
+| Distance      | 0.2170340  | -0.007194245   | 0.002980003   | 1.999467e-05   |
+| kNN3          | 0.1874309  | -0.007194245   | 0.004072117   | 1.144503e-03   |
+| kNN6          | 0.1421564  | -0.007194245   | 0.002044641   | 4.784123e-04   |
+<p style="text-align:center;">**Table 2**: Results of Moran's Test for Various Weight Matrices</p>
+
+The Distanced based weight matrix will be used hereon out. To understand the spatial lag at which spatial autocorrelation exists, consider the correlogram shown in Figure 3. Upto and including the fourth lag, the correlogram indicates positive spatial autocorrelation. Beyond the fourth lag, Moran's I tends to hover around 0 indicating there is no or very limited negative spatial autocorrelation. 
+
+```{r correlogram, message=FALSE, warning=FALSE, fig.cap="**Figure 3**: Correlogram of Spatial Lags for Distance Based Weights", fig.align='center'}
+dist.corr<-sp.correlogram(dist1, nbhd$avg_price_per_night, order=10, method='I', style='W', randomisation=FALSE, zero.policy=TRUE)
+plot(dist.corr, main='')
+```
+
+For an empirical estimate of Moran's I, consider a permutation test via Monte-Carlo simulation over 9999 replicates. The results of the test are shown in Figure 4, where the vertical red line indicates the true Moran's I value of the data. This test yields a p-value $=0.0012$ which is statistically significant.
+
+```{r permutation, include=FALSE}
+mcmc<-moran.mc(nbhd$avg_price_per_night,dist1.wts, nsim=9999)
+mcmc
+```
+
+```{r perm-plot, fig.cap="**Figure 4**: Permutation Test of Moran's I via Monte-Carlo Simulation", fig.align='center'}
+mcmc.hist<-hist(mcmc$res,freq=TRUE,col="light blue",main=" ",breaks=50, xlab="Moran's I")
+lines(mcmc$statistic,max(mcmc.hist$counts),type="h",col="red",lwd=2)
+```
+
+Overall, the above analysis indicates positive spatial autocorrelation of Average Price per Night across Toronto neighbourhoods.
+
+### 2.3.3 Local Moran's I
+
+See Figure 5 for a scatterplot of Local Moran's I corresponding to each neighbourhood in Toronto. The slope of the solid line reflects the Global Moran's I estimate ($\approx 0.217$) indicating positive spatial autocorrelation across Toronto. Examining the four quadrants:
+
+1. **High-High**: neighbourhoods have a high Average Price per Night and are surrounded by other similar neighbourhoods with high prices. e.g., Bridle Path-Sunnybrook-York Mills, Forest Hill South
+2. **Low-Low**: neighbourhoods have a low Average Price per Night and are surrounded by other similar neighbourhoods with low prices.
+3. **High-Low**: neighbourhoods have a high Average Price per Night and are surrounded by dissimilar neighbourhoods with low prices. e.g., Scarborough Village
+4. **Low-High**: neighbourhoods have a low Average Price per Night and are surrounded by dissimilar neighbourhoods with high prices. e.g., Guildwood
+
+An interesting insight to note is that Scarborough Village and Guildwood are adjacent neighbourhoods, and the clustering pattern is likely caused by Scarborough Village's extremely high Average Price per Night.
+```{r moran-scatter, echo=FALSE, fig.cap="**Figure 5**: Moran Scatterplot for Distance Based Weights", message=FALSE, warning=FALSE, fig.align='center'}
+moran.scatter<-moran.plot(nbhd$avg_price_per_night,dist1.wts, zero.policy=TRUE, pch=16, col="black",cex=.5, labels=as.character(nbhd$neighbourhood), main=" ", xlab='Average Price per Night ($)', ylab='Lagged Average Price per Night ($)', return_df=FALSE, quiet=TRUE)
+```
+
+The map in Figure 6 further illustrates Local Moran's I clusters. The following spatial patterns arise:
+
+1. **High-High**: neighbourhoods are located in the downtown core along Yonge St and in southwestern Toronto. These neighbourhoods tend to be more populous, close to recreational activities and homes are both larger and older which can explain their high prices.
+2. **Low-Low**: neighbourhoods are located mostly in Scarborough and the west-end of Toronto. These areas tend to be more low-income and consistent of mainly rental apartments and older bungalows which can explain their low prices.
+3. **High-Low**: neighbourhoods are scattered across the city, but many share a boundary with the lake directly or share boundaries with neighbourhoods that tend to be low-income.
+4. **Low-High**: neighbourhoods are scattered across the city, but many share boundaries with neighbourhoods that are close to the lake or near more affluent neighbourhoods areas as Sunnybrook and Forest Hill.
+
+```{r local-moran, message=FALSE, warning=FALSE, include=FALSE}
+# Compute local Moran and corresponding cluster:
+moran.local<-localmoran(nbhd$avg_price_per_night,dist1.wts,alternative='two.sided')
+nbhd$cluster<-attributes(moran.local)$quadr$mean
+
+# Make sure to test for adjusted using Bonferroni vs not. Hint: need some adjustment since we're testing different hypothesis. See updated code for W7
+# table(nbhd$cluster)
+```
+
+```{r plot-local-moran, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="**Figure 6**: Local Moran's I Clusters", fig.align='center'}
+hl.pal = colorFactor(c('blue','lightblue','orange','red'),
+                       levels=c("High-High", "High-Low","Low-High", "Low-Low"))
+
+nbhd %>%
+  leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(weight=1.2, fillOpacity=.5, label=~neighbourhood, color=~hl.pal(cluster)) %>%
+  leaflet::addLegend(pal = hl.pal, values = ~cluster, title = "Significant Local Moran's I Clusters", opacity = 0.7)
+```
+
+### 2.3.4. Local Getis-Ord G*
+
+The map in Figure 7 illustrates the Local Getis-Ord G* value for each neighbourhood. The following patterns can be noted:
+
+1. G* $\in (-2,0]$: neighbourhoods are located in northern Scarborough and the northwestern side of Toronto. These are mostly neighbourhoods with low Average Price per Night surrounded by other similar neighbourhoods with low prices.
+2. G* $\in (0,2)$: neighbourhoods are scattered across central Toronto. These are mostly neighbourhoods with moderate-to-high Average Price per Night surrounded by other similar neighbourhoods with moderate-to-high prices.
+3. G* $> 6$: only one such neighbourhood, Guildwood. Due to the high G* value, this is indicative of a hotspot where there is a cluster of neighbourhoods high-priced listings. This is likely the result of Scarborough Village, which is neighbouring Guildwood, having a significantly higher Average Price per Night.
+
+An interesting insight to note is that a similar hotspot does not arise near the Bridle Path-Sunnybrook-York Mills neighbourhood. This might be because there are numerous other adjacent neighbourhoods with moderately-priced listings that "dilutes" the impact of the significantly higher Average Price per Night.
+
+```{r local-getis, message=FALSE, warning=FALSE, include=FALSE}
+# Compute local Getis-Ord G* using Binary weights:
+knn1.bin<-nb2listw(knn1, style='B')
+nbhd$gstar<-localG(nbhd$avg_price_per_night,knn1.bin)
+```
+
+```{r plot-local-getis, message=FALSE, warning=FALSE, fig.cap="**Figure 7**: Local Getis-Ord G*", fig.align='center'}
+gstar.pal <- colorNumeric(palette =c('blue','orange','red'), domain = as.numeric(nbhd$gstar), reverse=FALSE)
+
+
+leaflet(nbhd) %>%
+  addProviderTiles('CartoDB.Positron') %>%
+  addPolygons(weight=1.2, fillOpacity=.6, label=~paste0(neighbourhood, ': ', round(gstar, 2)), color=~gstar.pal(as.numeric(gstar))) %>%
+  leaflet::addLegend(pal = gstar.pal, values = ~as.numeric(gstar), title = "Getis-Ord G*", opacity = 0.7)
+```
+
+## 2.4 Spatial Regression
+
+The exploration in the previous section illustrates the presence of spatial autocorrelation when examining the Average Price per Night for Airbnb listings across neighbourhoods of Toronto. Then consider modelling the dependent variable as a function of various independent variables, previously defined in Section 2.2 (Data Processing). This section will fit linear, spatial and conditional autoregressive models and present the fitted parameter estimates:
+
+1. **Linear** (via Ordinary Least Squares): fits a traditional linear regression model dependent only the specified covariates with no consideration for spatial autocorrelation.
+2. **SAR with Spatial Lag**: accounts for spatial autocorrelation in the specified covariates.
+3. **SAR with Spatial Error**: accounts for spatial autocorrelation in the fitted residuals and is treated as a nuisance parameter.
+4. **SAR with Spatial Lag and Error**: accounts for spatial autocorrelation in both the covariates and the residuals.
+5. **CAR**: accounts for spatial autocorrelation by modelling a value in each neighbourhood as conditionally dependent on its neighbours.
+
+```{r ar-models, message=FALSE, warning=FALSE, include=FALSE}
+# Linear
+mod_lm <- lm(avg_price_per_night ~ n_listings + n_listings_near_subway + pct_listings_near_landmark + median_income + is_outlier, data=nbhd)
+moran.lm <- moran.test(residuals(mod_lm), dist1.wts)
+
+# SAR Lag
+mod_sar_lag<-lagsarlm(avg_price_per_night ~ n_listings + n_listings_near_subway + pct_listings_near_landmark + median_income + is_outlier, data=nbhd, listw=dist1.wts)
+moran.sar_lag <- moran.test(residuals(mod_sar_lag), dist1.wts)
+
+# SAR Error
+mod_sar_err<-spautolm(avg_price_per_night ~ n_listings + n_listings_near_subway + pct_listings_near_landmark + is_outlier, data=nbhd, listw=dist1.wts)
+moran.sar_err <- moran.test(residuals(mod_sar_err), dist1.wts)
+
+# SAR Lag + Error
+mod_sar_lag_err<-sacsarlm(avg_price_per_night ~ n_listings + n_listings_near_subway + pct_listings_near_landmark + median_income + is_outlier, data=nbhd, listw=dist1.wts)
+moran.sar_lag_err <- moran.test(residuals(mod_sar_lag_err), dist1.wts)
+
+# CAR
+mod_car<-spautolm(avg_price_per_night ~ n_listings + n_listings_near_subway + pct_listings_near_landmark + median_income + is_outlier, data=nbhd, listw=dist1.wts, family='CAR')
+moran.car <- moran.test(residuals(mod_car), dist1.wts)
+
+# Results:
+data.frame(
+  Model=c('Linear', 'SAR Lag', 'SAR Error', 'SAR Lag + Error', 'CAR'), 
+  moran.I=c(moran.lm$estimate[1], moran.sar_lag$estimate[1], moran.sar_err$estimate[1], moran.sar_lag_err$estimate[1], moran.car$estimate[1]),
+  expectation=c(moran.lm$estimate[2], moran.sar_lag$estimate[2], moran.sar_err$estimate[2], moran.sar_lag_err$estimate[2], moran.car$estimate[2]),
+  variance=c(moran.lm$estimate[3], moran.sar_lag$estimate[3], moran.sar_err$estimate[3], moran.sar_lag_err$estimate[3], moran.car$estimate[3]),
+  p.value=c(moran.lm$p.value, moran.sar_lag$p.value, moran.sar_err$p.value, moran.sar_lag_err$p.value, moran.car$p.value)
+)
+```
+
+Note, all autoregressive modelling is done assuming Distance Based weights. Also, the specific combination of covariates chosen for each model was selected among other combinations to reduce the value of Moran's I for the fitted residuals. That is, minimizing the spatial autocorrelation in the fitted residuals such that the model accounts for maximal spatial autocorrelation in Average Price per Night. See Table 3 for a summary of the Moran's tests:
+
+| Model           | Moran's I      | Expectation     | Variance       | p-value     |
+|:------------------|:----------------|:-----------------|:----------------|:-------------|
+| Linear          | 0.1100039726   | -0.007194245    | 0.002966119    | 0.01570171  |
+| SAR Lag         | 0.0039558354   | -0.007194245    | 0.002959692    | 0.41880433  |
+| SAR Error       | 0.0056231746   | -0.007194245    | 0.002959741    | 0.40687187  |
+| SAR Lag + Error | 0.0006586813   | -0.007194245    | 0.002959586    | 0.44261215  |
+| CAR             | 0.0058175161   | -0.007194245    | 0.002961708    | 0.40551714  |
+<p style="text-align:center;">**Table 3**: Results of Moran's Test for Various Regression Models</p>
+
+It is evident based on the statistically significant Moran's I that the linear model still has spatial autocorrelation that is unexplained by the selected covariates. Comparatively, the autoregressive models have lower Moran's I indicating limited spatial autocorrelation in the residuals and non-statistically significant p-values such that the null hypothesis of no residual spatial autocorrelation can be accepted. See Table 4 for the estimated spatial parameters for the autoregressive models:
+
+| Model           | $\hat{\rho}$ (p-value)   | $\hat{\lambda}$ (p-value)   | $\hat{\sigma}^2$   | LR Test Value | AIC    |
+|:------------------|:--------------------------|:-----------------------------|:--------------------|:---------------|:--------|
+| SAR Lag          | 0.2371 (0.004)          | N/A                         | 1043.8             | 8.3128        | 1388.0   |
+| SAR Error        | N/A                      | 0.25494 (0.051)             | 1240.6             | 3.8166        | 1410.5 |
+| SAR Lag+Error    | 0.22985 (0.039)         | 0.01906 (0.914)            | 1044.4             | 8.3234        | 1390.0   |
+| CAR              | N/A                      | 0.25161 (0.158)             | 1097.6             | 1.9892        | 1394.3 |
+<p style="text-align:center;">**Table 4**: Fitted Spatial Parameters and Model Metrics for Various Autoregressive Models</p>
+
+The CAR model does not have a statistically significant spatial parameter $\lambda$ and has a very low LR Test value, compared to the SAR models. Similarly the SAR model with both Spatial Lag and Error does not have a statistically significant spatial parameter $\lambda$ although it has a very high LR Test value. On the other hand, the SAR models with Spatial Lag or Spatial Error both have statistically significant spatial parameters, $\rho$ and $\lambda$ respectively. Between these two models, the SAR model with Spatial Lag is selected to best model Average Price per Night while accounting for spatial autocorrelation since:
+
+- $\hat{\sigma}^2=1043.8$, which measures variance in the residuals, is significantly lower
+- LR Test Value $=8.3128$, which measures the likelihood of the data, is significantly higher
+- AIC $=1388$, which is measure of the balance between model fit and complexity, is slightly lower
+
+# 3 Results
+
+In the previous section, a SAR model with Spatial Lag was selected to best-model the dependent variable Average Price per Night. See Table 5 for the fitted coefficients. Of the six fitted coefficients, all are statistically significant except for Number of Listings which has a somewhat significant p-value $\approx 0.15$ and Percent of Listings near Landmarks. The estimate for the Is Outlier Neighbourhood coefficient is much higher in magnitude than the other coefficients, which makes intuitive sense because this variable is used to account for the stark difference in Average Price per Night for the two neighbourhoods (i.e., Bridle Path-Sunnybrook-York Mills, Scarborough Village) when compared to the average neighbourhood.
+
+| Coefficient                          | Estimate     | p-value    |
+|:--------------------------------------|:--------------|:------------|
+| Intercept                            | 41.163510    | 0.005794  |
+| Number of Listings                   | -0.114544    | 0.148167   |
+| Number of Listings near Subway       | 0.150386     | 0.054734   |
+| Percent of Listings near Landmarks   | 6.269885     | 0.501103   |
+| Median Income                        | 0.395088    | 3.295e-05  |
+| Is Outlier Neighbourhood             | 334.650708   | < 2.2e-16  |
+<p style="text-align:center;">**Table 5**: Fitted Coefficients of SAR Model with Spatial Lag</p>
+
+## 3.1 Residual Analysis
+
+Consider again the SAR model with Spatial Lag, but fitted without the Is Outlier Neighbourhood covariate. See Table 6 for a comparison of Moran's I tests of the residuals. Although neither Moran's I values are statistically significant (do not reject the null hypothesis of no residual autocorrelation), the value is higher after removing the covariate indicating that there is more residual autocorrelation. See Table 7 for a comparison of the estimated spatial parameters and model metrics. Removing the covariate yields a spatial parameter $\rho$ which is not statistically significant, a much higher residual variance, AIC and SSE, and a much lower LR Test value. 
+
+```{r sar-lag2}
+final_mod = mod_sar_lag
+
+nbhd$pred = final_mod$fitted.values
+nbhd$resid = residuals(final_mod)
+
+# SAR Lag
+mod_sar_lag2<-lagsarlm(avg_price_per_night ~ n_listings + n_listings_near_subway + pct_listings_near_landmark + median_income, data=nbhd, listw=dist1.wts)
+moran.sar_lag2 <- moran.test(residuals(mod_sar_lag2), dist1.wts)
+
+nbhd$resid2 = residuals(mod_sar_lag2)
+```
+
+| Includes Outlier Covariate | Moran's I      | Expectation     | Variance       | p-value    |
+|:----------------------------|:----------------|:-----------------|:----------------|:------------|
+| Yes                        | 0.0039558354   | -0.007194245    | 0.002959692    | 0.41880433 |
+| No                         | 0.007760144    | -0.007194245    | 0.002392637    | 0.37990000 |
+<p style="text-align:center;">**Table 6**: Results of Moran's Test for SAR model with Spatial Lag, with and without Outlier Covariate</p>
+
+| Includes Outlier Covariate | $\hat{\rho}$ (p-value) | $\hat{\sigma}^2$ | LR Test Value | AIC   | SSE       |
+|:----------------------------|:------------------------|:------------------|:---------------|:-------|:-----------|
+| Yes                        | 0.23710 (0.004)        | 1043.8           | 8.3128        | 1388.0  | 146129.5  |
+| No                         | 0.15955 (0.157)       | 2570.6           | 2.0008        | 1511.3| 359879.1  |
+<p style="text-align:center;">**Table 7**: Fitted Spatial Parameters and Model Metrics for SAR model with Spatial Lag, with and without Outlier Covariate</p>
+
+For a further comparison, consider the followings maps in Figure 8 of the fitted residuals for each model. Both maps use the same colour scale to map residuals. Overall, the residuals in Figure 8a are of much lower absolute magnitude (i.e., $|\hat{\epsilon}_a| \leq \$100$) and very similar in colour, while the residuals in Figure 8b have more variance (i.e., $|\hat{\epsilon}_b| \leq \$350$). Notably, the residuals for the two outlier neighbourhoods and some central neighbourhoods are darker in hue when compared to the map in Figure 8a. This suggests that including a Boolean covariate to indicate the two outlier neighbourhoods successfully allowed the model to better-fit the remaining 138 neighbourhoods thus reducing the residuals and SSE.
+
+```{r resid-orig, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="**Figure 8a**: Map of Residual Average Price per Night, With Outlier Covariate", fig.align='center'}
+resid.pal <- colorNumeric(palette =c('yellow', 'orange', 'red'), domain = as.numeric(nbhd$resid2), reverse=FALSE)
+
+leaflet(nbhd) %>%
+  addProviderTiles('CartoDB.Positron') %>%
+  addPolygons(weight=1.2, fillOpacity=.6, label=~paste0(neighbourhood, ': $', round(resid, 2)), color=~resid.pal(as.numeric(resid))) %>%
+  leaflet::addLegend(pal = resid.pal, values = ~as.numeric(resid), title = "Residual Avg. Price per Night ($)", opacity = 0.7)
+```
+
+```{r resid2-orig, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="**Figure 8b**: Map of Residual Average Price per Night, Without Outlier Covariate", fig.align='center'}
+resid.pal2 <- colorNumeric(palette =c('yellow', 'orange', 'red'), domain = as.numeric(nbhd$resid2), reverse=FALSE)
+
+leaflet(nbhd) %>%
+  addProviderTiles('CartoDB.Positron') %>%
+  addPolygons(weight=1.2, fillOpacity=.6, label=~paste0(neighbourhood, ': $', round(resid2, 2)), color=~resid.pal(as.numeric(resid2))) %>%
+  leaflet::addLegend(pal = resid.pal, values = ~as.numeric(resid2), title = "Residual Avg. Price per Night ($)", opacity = 0.7)
+```
+
+## 3.2 Fitted Values
+
+As a final step, consider the map in Figure 9 depicting the fitted values using the SAR model with Spatial Lag outlined in Table 5. Note this map uses the same colour scale as the map used in Figure 1.The Bridle Path-Sunnybrook-York Mills and Scarborough Village neighbourhoods have a fitted Average Price per Night that is much higher than all other neighbourhoods, which aligns with the true values and is due to the inclusion of the Outlier covariate. Majority of the neighbourhoods have fitted values between \$100 and $200, which agrees with the true values as seen in Figure 1. Some neighbourhoods which have a true Average Price per Night in the \$200 range were successfully identified, namely Waterfront Communities-The Island and a few more in Midtown Toronto that intersect with Yonge St.
+
+```{r predict-orig, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="**Figure 9**: Map of Fitted Average Price per Night", fig.align='center'}
+pred.pal <- colorNumeric(palette =c('darkgreen', 'yellow', 'red'), domain = c(0,525), reverse=FALSE)
+
+leaflet(nbhd) %>%
+  addProviderTiles('CartoDB.Positron') %>%
+  addPolygons(weight=1.2, fillOpacity=.6, label=~paste0(neighbourhood, ': $', round(pred, 2)), color=~pred.pal(as.numeric(pred))) %>%
+  leaflet::addLegend(pal = pred.pal, values = ~as.numeric(pred), title = "Fitted Avg. Price per Night ($)", opacity = 0.7)
+```
+
+# 4 Conclusion
+
+To conclude, the above analysis found significant evidence of positive spatial correlation in the Average Price per Night of Airbnb listings in Toronto as-of September 5, 2024. This was established globally (i.e., over the entire study area) and in clusters throughout neighbourhoods in the city. More specifically, listings in neighbourhoods adjacent to Yonge St., near the downtown core and bordering the lake tend to be higher in price. Conversely, listings in suburban neighbourhoods tend to be lower in price. The fitted spatial regression model highlights some interesting relationships between the Average Price per Night and selected covariates. In particular, there appears to be a positive relationship with proximity to TTC Subway Station and Median Income, and an slightly inverse relationship with Number of Listings.
+
+## 4.1 Limitations
+
+Although the analysis uncovered some valuable insights, there are a few limitations. Namely:
+
+1. **Data Quality**: the sourced data is a snapshot of current listings as of September 5, 2024. Consequently, care must be taken when generalizing the analysis to a different day/time, especially if there are key temporal factors at play (e.g., tourism seasonality).
+2. **Areal Data**: as mentioned in Section 2.3.2, aggregating listing price data to a neighbourhood-level can be considered somewhat arbitrary. In reality, hosts are likely pricing their listings based on general proximity among other factors, and not necessarily based on the official neighbourhood boundaries. As such, areal analysis might create "artificial" differences between neighbourhoods that wouldn't otherwise exist.
+3. **Features**: only a handful of features were considered in Section 2.4 which might not be sufficient to model the desired relationships. Some features could potentially be defined differently (e.g., distance for buffer-based features, top N landmarks) and the models could be refit.
+
+## 4.2 Next Steps
+
+To improve upon the analysis, the following next steps could be explored:
+
+1. **Temporal**: leveraging spatio-temporal techniques to determine if the Average Price per Night changes spatially and across seasons. This could help model relationships such as certain neighbourhoods decreasing in price during certain seasons or months of the year.
+2. **Point Process Data**: since the original data contains the listing price at discrete locations throughout the city, it could also be potentially modeled using point process techniques. There would need to be some consideration for the anonymization of exact locations and the same location having multiple measurements (e.g., condominiums, apartments).
+3. **Feature Domains**: increasing the number of domains from which feature are derived. One domain this analysis did not consider is housing prices and proximity to major (non-TTC) transit routes. Expanding covariates to reflect more relevant factors will help to better-model relationships and assess interactions.

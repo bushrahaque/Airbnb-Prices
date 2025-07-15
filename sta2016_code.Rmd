@@ -1,0 +1,460 @@
+---
+title: "STA 2016 Final Project Code"
+author: "Bushra Haque"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(kableExtra)
+library(tidyverse)
+library(leaflet)
+library(leaflegend)
+library(sf)
+library(geoR)
+library(ggmap)
+library(fields)
+library(maps)
+library(mapdata)
+library(units)
+library(mgcv)
+library(mgcViz)
+library(spdep)
+library(spData)
+library(spatialreg) # for SAR and CAR
+library(spgwr) # for GWR
+library(spaMM) # for mixed effects models
+library(spatstat)
+library(splancs)
+library(dbscan)
+```
+
+```{r data-load, message=FALSE, warning=FALSE, include=FALSE}
+data.dir = gsub('/code', '/data', getwd())
+tdot.srid = 32617
+
+# Load airbnb data:
+airbnb_sept = st_read(paste0(data.dir, '/data/listings_sept2024.csv')) %>%
+  select('id', 'neighbourhood', 'latitude', 'longitude', 'price') %>%
+  mutate(listing_id=as.numeric(id), price=as.numeric(ifelse(price=='','0',price)), latitude=as.numeric(latitude), longitude=as.numeric(longitude)) %>%
+  mutate(neighbourhood=ifelse(neighbourhood=='Danforth East York', 'Danforth-East York', neighbourhood)) %>%
+  mutate(neighbourhood=ifelse(neighbourhood=='Mimico (includes Humber Bay Shores)', 'Mimico', neighbourhood)) %>%
+  st_as_sf(coords=c('latitude', 'longitude'), crs=4326, remove=FALSE)
+
+airbnb_march = st_read(paste0(data.dir, '/data/listings_march2024.csv')) %>%
+  select('id', 'neighbourhood', 'latitude', 'longitude', 'price') %>%
+  mutate(listing_id=as.numeric(id), price=as.numeric(ifelse(price=='','0',price)), latitude=as.numeric(latitude), longitude=as.numeric(longitude)) %>%
+  mutate(neighbourhood=ifelse(neighbourhood=='Danforth East York', 'Danforth-East York', neighbourhood)) %>%
+  mutate(neighbourhood=ifelse(neighbourhood=='Mimico (includes Humber Bay Shores)', 'Mimico', neighbourhood)) %>%
+  st_as_sf(coords=c('latitude', 'longitude'), crs=4326, remove=FALSE)
+
+# Load income data:
+stat = st_read(paste0(data.dir, '/data/neighbourhood-stats-1.csv')) %>%
+  mutate(neighbourhood=ifelse(Neighbourh=='Dovercourt-Wallace Emerson-Juncti', 'Dovercourt-Wallace Emerson-Junction', Neighbourh)) %>%
+  mutate(median_income=as.numeric(median_family_income)) %>%
+  select('neighbourhood', 'median_income')
+
+# Load shape files:
+nbhd.shp = st_read(paste0(data.dir, '/data/Toronto_Neighbourhoods/Toronto_Neighbourhoods.shp')) %>%
+  mutate(neighbourhood=ifelse(Neighbourh=='Dovercourt-Wallace Emerson-Juncti', 'Dovercourt-Wallace Emerson-Junction', Neighbourh)) %>%
+  mutate(population=as.numeric(Total_Popu)) %>%
+  select('neighbourhood', 'geometry', 'population')
+
+ttc = read.delim(paste0(data.dir, '/data/TTC Routes and Schedules Data/stops.txt'), sep=',') %>%
+  filter(((stop_id >= 14404) & (stop_id <= 14539)) | ((stop_id >= 15692) & (stop_id <= 15702))) %>%
+  separate(col='stop_name', sep=' - ', into=c('station_name', 'station_type')) %>%
+  filter(station_name != 'Yonge Station') %>%
+  group_by(station_name) %>%
+  filter(min_rank(desc(stop_id))==1) %>%
+  select('station_name', 'latitude'='stop_lat', 'longitude'='stop_lon') %>% 
+  st_as_sf(coords=c('latitude', 'longitude'), crs=4326, remove=FALSE)
+
+ttc.proj = ttc %>% st_transform(crs=tdot.srid)
+```
+
+```{r data-landmarks}
+register_google(key = "AIzaSyD1Rdw1ZNe5byS8M5vGcwjy_hssCDsbPYQ")
+
+landmarks <- c("CN Tower, Toronto",
+               "Royal Ontario Museum, Toronto",
+               "Ripley's Aquarium of Canada, Toronto",
+               "Distillery Historic District, Toronto",
+               "Art Gallery of Ontario, Toronto",
+               "Casa Loma, Toronto",
+               "Toronto Islands, Toronto",
+               "St. Lawrence Market, Toronto",
+               "Hockey Hall of Fame, Toronto",
+               "Nathan Phillips Square, Toronto")
+
+geocoded_data <- geocode(landmarks)
+landmarks_df <- data.frame(
+  name = landmarks,
+  latitude = geocoded_data$lat,
+  longitude = geocoded_data$lon
+) %>%
+st_as_sf(coords=c('latitude', 'longitude'), crs=4326, remove=FALSE)
+```
+
+```{r data-buffer, include=FALSE}
+ttc.buffer = ttc.proj %>%
+  st_buffer(dist=1000)
+
+lndmark.buffer = landmarks_df %>%
+  st_transform(crs=tdot.srid) %>%
+  st_buffer(dist=2000)
+
+airbnb_sept.ttc = st_join(ttc.buffer, st_transform(airbnb_sept, crs=tdot.srid), join=st_intersects, left=TRUE) %>%
+  st_drop_geometry() %>%
+  select('listing_id') %>%
+  unique()
+
+airbnb_sept.lndmark = st_join(lndmark.buffer, st_transform(airbnb_sept, crs=tdot.srid), join=st_intersects, left=TRUE) %>%
+  st_drop_geometry() %>%
+  select('listing_id') %>%
+  unique()
+
+airbnb_sept.ttc.list = as.vector(airbnb_sept.ttc[['listing_id']])
+airbnb_sept.lndmark.list = as.vector(airbnb_sept.lndmark[['listing_id']])
+```
+
+```{r data-agg-join, message=FALSE, warning=FALSE, include=FALSE}
+# Aggregate data:
+airbnb_sept_agg = airbnb_sept %>%
+  mutate(near_subway=ifelse(listing_id %in% airbnb_sept.ttc.list, 1, 0)) %>%
+  mutate(near_landmark=ifelse(listing_id %in% airbnb_sept.lndmark.list, 1, 0)) %>%
+  group_by(neighbourhood) %>%
+  summarise(avg_sept_price=as.numeric(mean(price)), n_sept_listings=n(), n_listings_near_subway=as.numeric(sum(near_subway)), n_listings_near_landmark=as.numeric(sum(near_landmark))) %>%
+  st_drop_geometry()
+
+airbnb_march_agg = airbnb_march %>%
+  group_by(neighbourhood) %>%
+  summarise(avg_mar_price=as.numeric(mean(price)), n_mar_listings=n()) %>%
+  st_drop_geometry()
+
+# Join data:
+nbhd.stats = merge(nbhd.shp, stat, by='neighbourhood') %>%
+  select('neighbourhood', 'median_income', 'population', 'geometry')
+
+nbhd.stats1 = merge(nbhd.stats, airbnb_sept_agg, by='neighbourhood', all.x=TRUE)
+nbhd.stats2 = merge(nbhd.stats1, airbnb_march_agg, by='neighbourhood', all.x=TRUE)
+```
+
+```{r data-feature-eng}
+nbhd = nbhd.stats2 %>%
+  mutate(
+    n_listings_per_capita=n_sept_listings * 1000 / population,
+    pct_listings_near_subway=n_listings_near_subway / n_sept_listings,
+    pct_listings_near_landmark=n_listings_near_landmark / n_sept_listings
+  )
+
+nbhd.proj = nbhd %>% st_transform(crs=tdot.srid)
+```
+
+#### Base Map of Sept. Avg Price
+
+```{r sept-base-map, message=FALSE, warning=FALSE}
+pal = colorNumeric(palette =c('darkgreen', 'yellow', 'red'), domain = as.numeric(nbhd$avg_sept_price))
+
+nbhd %>%
+  leaflet() %>%
+  addProviderTiles('CartoDB.Positron') %>%
+  addPolygons(weight=0.9, fillOpacity=0.7, color='black', label=~paste0(neighbourhood, ': $', round(avg_sept_price,2)), fillColor=~pal(avg_sept_price)) %>%
+  addCircles(data=ttc, lng=~longitude, lat=~latitude, color='black', opacity=0.9, radius=0.005, label=~station_name) %>%
+  addCircles(data=landmarks_df, lng=~longitude, lat=~latitude, color='purple', opacity=0.9, radius=0.005, label=~name) %>%
+  leaflet::addLegend(pal = pal, values = ~as.numeric(avg_sept_price), title = "Avg. Sept Price ($)", opacity = 0.7)
+```
+
+
+```{r sept-ppp-buffer, message=FALSE, warning=FALSE, include=FALSE}
+nbhd.proj %>% 
+  ggplot() +
+  geom_sf(aes(fill=avg_sept_price)) +
+  scale_fill_continuous(low='green', high='red') +
+  labs(title='Avg. Price per Night, Sept 2024', fill='Avg. Price per Night ($)')
+```
+#### Adjacency Matrices & Weights
+
+Why we might want distance over contiguity based?
+
+```{r adj-queen}
+queen<-poly2nb(nbhd, queen=TRUE)
+
+plot(st_geometry(nbhd), border = "lightgray", main = "Queen Contiguity Neighbors")
+plot(queen, st_coordinates(st_centroid(st_geometry(nbhd))), add = TRUE, col = "blue", lwd = 1)
+
+queen.wts<-nb2listw(queen, style='W')
+summary(unlist(queen.wts$weights))
+```
+
+```{r adj-knn}
+# Compute centroids of neighbourhoods
+nbhd.centroids <- st_centroid(nbhd)
+
+# Extract coordinates of neighbourhoods
+coords <- st_coordinates(nbhd.centroids)
+
+# Compute neighbours
+knn3<-knn2nb(knearneigh(coords, k=3))
+
+plot(st_geometry(nbhd), border = "lightgray", main="knn-3")
+plot(knn3,st_coordinates(st_centroid(st_geometry(nbhd))),add=TRUE, col="blue", lwd=1)
+
+knn3.wts<-nb2listw(knn3, style='W')
+summary(unlist(knn3.wts$weights))
+
+# Compute neighbours
+knn6<-knn2nb(knearneigh(coords, k=6))
+
+plot(st_geometry(nbhd), border = "lightgray", main="knn-6")
+plot(knn6,st_coordinates(st_centroid(st_geometry(nbhd))),add=TRUE, col="blue", lwd=1)
+
+knn6.wts<-nb2listw(knn6, style='W')
+summary(unlist(knn6.wts$weights))
+```
+
+```{r adj-dist}
+# Compute neighbours for k=1
+knn1<-knn2nb(knearneigh(coords, k=1))
+
+# Compute neighbours within max distance:
+ndist<-unlist(nbdists(knn1, coords))
+max.dist<-max(ndist)
+dist1<-dnearneigh(coords, d1=0, d2=max.dist)
+
+plot(st_geometry(nbhd), border = "lightgray", main="Distance Neighbours")
+plot(dist1, coords, add=T,col="blue", lwd=1)
+
+dist1.wts<-nb2listw(dist1, style='W', zero.policy=TRUE)
+summary(unlist(dist1.wts$weights))
+```
+
+#### Global Moran's I
+
+This will give a general statistic for the entire study area. We pick fixed distance with row standardization.
+
+```{r global-moran}
+moran.queen<-moran.test(nbhd$avg_sept_price,queen.wts,randomisation=FALSE)
+moran.knn3<-moran.test(nbhd$avg_sept_price,knn3.wts,randomisation=FALSE)
+moran.knn6<-moran.test(nbhd$avg_sept_price,knn6.wts,randomisation=FALSE)
+moran.dist1<-moran.test(nbhd$avg_sept_price,dist1.wts,randomisation=FALSE)
+
+data.frame(
+  weight.matrix=c('Queen', 'kNN3', 'kNN6', 'IDW'), 
+  moran.I=c(moran.queen$estimate[1], moran.knn3$estimate[1], moran.knn6$estimate[1], moran.dist1$estimate[1]),
+  expectation=c(moran.queen$estimate[2], moran.knn3$estimate[2], moran.knn6$estimate[2], moran.dist1$estimate[2]),
+  variance=c(moran.queen$estimate[3], moran.knn3$estimate[3], moran.knn6$estimate[3], moran.dist1$estimate[3]),
+  p.value=c(moran.queen$p.value, moran.knn3$p.value, moran.knn6$p.value, moran.dist1$p.value)
+)
+```
+
+```{r idw-row-std}
+dist1.wts.bin<-nb2listw(dist1, style='B')
+moran.dist1.bin<-moran.test(nbhd$avg_sept_price,dist1.wts.bin,randomisation=FALSE)
+
+data.frame(
+  idw.weights=c('Row Standardized', 'Binary'), 
+  moran.I=c(moran.dist1$estimate[1], moran.dist1.bin$estimate[1]),
+  expectation=c(moran.dist1$estimate[2], moran.dist1.bin$estimate[2]),
+  variance=c(moran.dist1$estimate[3], moran.dist1.bin$estimate[3]),
+  p.value=c(moran.dist1$p.value, moran.dist1.bin$p.value)
+)
+```
+
+If you're analyzing Airbnb data in Toronto:
+
+- Positive Moran’s I at short lags might indicate clustering of high-priced listings in affluent neighborhoods.
+- A transition to negative Moran’s I at intermediate lags could suggest competition among listings or distinct pricing zones.
+- Moran’s I near zero at larger lags suggests no meaningful relationship beyond a certain distance, potentially due to unrelated neighborhood effects.
+
+```{r correlelogram}
+dist.corr<-sp.correlogram(dist1, nbhd$avg_sept_price, order=7, method='I', style='W', randomisation=FALSE, zero.policy=TRUE)
+
+plot(dist.corr,main="Moran's I for Avg Sept Price Correlogram")
+```
+
+#### MCMC + Permutation
+
+Similar p-value + significant.
+
+```{r permutation}
+mcmc<-moran.mc(nbhd$avg_sept_price,dist1.wts, nsim=9999)
+mcmc
+```
+
+```{r perm-plot}
+mcmc.hist<-hist(mcmc$res,freq=TRUE,col="light blue",main="Permutation Test for Moran's I - 9999 Permutations",breaks=50)
+lines(mcmc$statistic,max(mcmc.hist$counts),type="h",col="red",lwd=2)
+```
+
+#### Local Moran's I
+
+```{r local-moran}
+# Compute local Moran and corresponding cluster:
+moran.local<-localmoran(nbhd$avg_sept_price,dist1.wts,alternative='two.sided')
+nbhd$cluster<-attributes(moran.local)$quadr$mean
+
+# Make sure to test for adjusted using Bonferroni vs not. Hint: need some adjustment since we're testing different hypothesis. See updated code for W7
+table(nbhd$cluster)
+```
+
+```{r plot-local-moran}
+hl.pal = colorFactor(c('red','yellow', 'darkgreen'),
+                       levels=c("High-High","Low-High","High-Low", "Low-Low"))
+
+nbhd %>%
+  leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(weight=1.2, fillOpacity=.5, label=~neighbourhood, color=~hl.pal(cluster)) %>%
+  leaflet::addLegend(pal = hl.pal, values = ~cluster, title = "Significant Local Moran's I Clusters", opacity = 0.7)
+```
+
+#### Local Getis' Ord
+
+```{r local-getis}
+# Compute local Getis-Ord G* using Binary weights:
+knn1.bin<-nb2listw(knn1, style='B')
+nbhd$gstar<-localG(nbhd$avg_sept_price,knn1.bin)
+```
+
+```{r plot-local-getis}
+gstar.pal <- colorNumeric(palette =c('red', 'yellow', 'darkgreen'), domain = as.numeric(nbhd$gstar), reverse=TRUE)
+
+
+leaflet(nbhd) %>%
+  addProviderTiles('CartoDB.Positron') %>%
+  addPolygons(weight=1.2, fillOpacity=.6, label=~paste0(neighbourhood, ': ', round(gstar, 2)), color=~gstar.pal(as.numeric(gstar))) %>%
+  leaflet::addLegend(pal = gstar.pal, values = ~as.numeric(gstar), title = "Getis-Ord Gi*", opacity = 0.7)
+```
+
+#### Model Fitting
+
+**Linear**
+
+```{r linear}
+mod_lm <- lm(avg_sept_price ~ n_sept_listings + n_listings_near_subway + median_income, data=nbhd)
+nbhd$lm_resid<-residuals(mod_lm)
+
+summary(mod_lm)
+moran.test(nbhd$lm_resid, dist1.wts)
+```
+
+**SAR Spatial Error**
+
+```{r sar-err}
+mod_sar_err<-spautolm(avg_sept_price ~ n_sept_listings + n_listings_near_subway + median_income, data=nbhd, listw=dist1.wts)
+nbhd$sar_err_resid<-residuals(mod_sar_err)
+
+summary(mod_sar_err)
+moran.test(nbhd$sar_err_resid, dist1.wts)
+```
+
+**SAR Spatial Lag**
+
+```{r sar-lag}
+mod_sar_lag<-lagsarlm(avg_sept_price ~ n_sept_listings + n_listings_near_subway + median_income, data=nbhd, listw=dist1.wts)
+nbhd$sar_lag_resid<-residuals(mod_sar_lag)
+
+summary(mod_sar_lag)
+moran.test(nbhd$sar_lag_resid, dist1.wts)
+```
+
+**SAR Spatial Lag + Error**
+
+```{r sar-lag-err}
+mod_sar_lag_err<-sacsarlm(avg_sept_price ~ n_sept_listings + n_listings_near_subway, data=nbhd, listw=dist1.wts)
+nbhd$sar_lag_err_resid<-residuals(mod_sar_lag_err)
+
+summary(mod_sar_lag_err)
+moran.test(nbhd$sar_lag_err_resid, dist1.wts)
+```
+
+**CAR**
+
+```{r car}
+mod_car<-spautolm(avg_sept_price ~ n_sept_listings + n_listings_near_subway, data=nbhd, listw=dist1.wts, family='CAR')
+nbhd$car_resid<-residuals(mod_car)
+
+summary(mod_car)
+moran.test(nbhd$car_resid, dist1.wts)
+```
+
+
+```{r data-nov, eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+# Get listing data:
+airbnb_nov = st_read(paste0(data.dir, '/data/listings_nov2024.csv')) %>%
+  select('id', 'neighbourhood', 'latitude', 'longitude', 'price') %>%
+  mutate(listing_id=as.numeric(id), price=as.numeric(ifelse(price=='','0',price)), latitude=as.numeric(latitude), longitude=as.numeric(longitude)) %>%
+  mutate(neighbourhood=ifelse(neighbourhood=='Danforth East York', 'Danforth-East York', neighbourhood)) %>%
+  mutate(neighbourhood=ifelse(neighbourhood=='Mimico (includes Humber Bay Shores)', 'Mimico', neighbourhood)) %>%
+  st_as_sf(coords=c('latitude', 'longitude'), crs=4326, remove=FALSE)
+
+# Get intersection data:
+airbnb_nov.ttc = st_join(ttc.buffer, st_transform(airbnb_nov, crs=tdot.srid), join=st_intersects, left=TRUE) %>%
+  st_drop_geometry() %>%
+  select('listing_id') %>%
+  unique()
+
+airbnb_nov.lndmark = st_join(lndmark.buffer, st_transform(airbnb_nov, crs=tdot.srid), join=st_intersects, left=TRUE) %>%
+  st_drop_geometry() %>%
+  select('listing_id') %>%
+  unique()
+
+airbnb_nov.ttc.list = as.vector(airbnb_nov.ttc[['listing_id']])
+airbnb_nov.lndmark.list = as.vector(airbnb_nov.lndmark[['listing_id']])
+
+# Aggregate data:
+airbnb_nov_agg = airbnb_nov %>%
+  mutate(near_subway=ifelse(listing_id %in% airbnb_nov.ttc.list, 1, 0)) %>%
+  mutate(near_landmark=ifelse(listing_id %in% airbnb_nov.lndmark.list, 1, 0)) %>%
+  group_by(neighbourhood) %>%
+  summarise(avg_price_per_night=as.numeric(mean(price)), n_listings=n(), n_listings_near_subway=as.numeric(sum(near_subway)), n_listings_near_landmark=as.numeric(sum(near_landmark))) %>%
+  st_drop_geometry()
+
+# Join data:
+
+nbhd.stats1.nov = merge(nbhd.stats, airbnb_nov_agg, by='neighbourhood', all.x=TRUE)
+
+# Final
+nbhd.nov = nbhd.stats1.nov %>%
+  mutate(
+    n_listings_per_capita=n_listings * 1000 / population,
+    pct_listings_near_subway=n_listings_near_subway / n_listings,
+    pct_listings_near_landmark=n_listings_near_landmark / n_listings,
+    is_outlier=ifelse(neighbourhood %in% c('Bridle Path-Sunnybrook-York Mills', 'Scarborough Village'),1,0)
+  )
+```
+
+```{r mod-nov, eval=FALSE, include=FALSE}
+# SAR Lag
+mod_sar_lag.nov<-lagsarlm(avg_price_per_night ~ n_listings + n_listings_near_subway + pct_listings_near_landmark + median_income + is_outlier, data=nbhd.nov, listw=dist1.wts)
+moran.sar_lag.nov <- moran.test(residuals(mod_sar_lag.nov), dist1.wts)
+
+# SAR Error
+mod_sar_err.nov<-spautolm(avg_price_per_night ~ n_listings + n_listings_near_subway + pct_listings_near_landmark + is_outlier, data=nbhd.nov, listw=dist1.wts)
+moran.sar_err.nov <- moran.test(residuals(mod_sar_err.nov), dist1.wts)
+```
+
+```{r predict-nov, eval=FALSE, fig.cap="Fig ?: Map of Predicted Average Price per Night, message=FALSE, warning=FALSE, include=FALSE}
+final_mod.nov = mod_sar_lag.nov
+
+nbhd.nov$pred = final_mod.nov$fitted.values
+nbhd.nov$resid = residuals(final_mod.nov)
+
+pred.pal <- colorNumeric(palette =c('darkgreen', 'yellow', 'red'), domain = as.numeric(nbhd.nov$pred), reverse=FALSE)
+# pred.pal <- pal
+
+leaflet(nbhd.nov) %>%
+  addProviderTiles('CartoDB.Positron') %>%
+  addPolygons(weight=1.2, fillOpacity=.6, label=~paste0(neighbourhood, ': $', round(pred, 2)), color=~pred.pal(as.numeric(pred))) %>%
+  leaflet::addLegend(pal = pred.pal, values = ~as.numeric(pred), title = "Predicted Avg. Price per Night ($)", opacity = 0.7)
+```
+
+```{r resid-nov, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="Fig ?: Map of Residual Average Price per Night, Nov 2024"}
+resid.pal <- colorNumeric(palette =c('yellow', 'orange', 'red'), domain = as.numeric(nbhd.nov$resid), reverse=FALSE)
+
+leaflet(nbhd.nov) %>%
+  addProviderTiles('CartoDB.Positron') %>%
+  addPolygons(weight=1.2, fillOpacity=.6, label=~paste0(neighbourhood, ': $', round(resid, 2)), color=~resid.pal(as.numeric(resid))) %>%
+  leaflet::addLegend(pal = resid.pal, values = ~as.numeric(resid), title = "Residual Avg. Price per Night ($)", opacity = 0.7)
+```
